@@ -1,0 +1,15 @@
+[project]
+name = "embedding-experiment"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=2.2.0",
+    "openai>=1.57.4",
+]
+
+[dependency-groups]
+dev = [
+    "black>=24.10.0",
+]
