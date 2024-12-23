@@ -7,9 +7,63 @@ from openai.types.chat import (
     ChatCompletionUserMessageParam,
 )
 from pathlib import Path
-from typing import Optional
+from typing import Annotated, Literal, Optional, NamedTuple, TypeAlias
 import numpy as np
 import base64
+from datetime import datetime
+import hashlib
+
+from pydantic import BaseModel, Field
+
+
+class Section(NamedTuple):
+    header: str
+    lines: list[str]
+
+
+Vector: TypeAlias = list[float]
+
+
+class MarkdownChunk(BaseModel):
+    source_type: Literal["markdown_section"] = "markdown_section"
+    key: str
+    original_file_path: str
+    content: str
+
+
+class EmbeddedChunk(BaseModel):
+    chunk: MarkdownChunk
+    vector: Vector
+
+
+class MarkdownFile:
+    def __init__(self, path: Path):
+        lines = []
+        with open(path, "r") as f:
+            lines = f.readlines()
+        self.title: Optional[str] = None
+        self.pre_section: Optional[list[str]] = None
+        self.sections: list[Section] = []
+
+        current_section: Optional[Section] = None
+
+        for line in lines:
+            line = line.strip()
+            if line.startswith("# "):
+                self.title = line[len("# ") :]
+            elif line.startswith("## "):
+                header = line[len("## ") :]
+                if current_section is not None:
+                    self.sections.append(current_section)
+                current_section = Section(header=header, lines=[])
+            elif current_section is None:
+                if self.pre_section is None:
+                    self.pre_section = []
+                self.pre_section.append(line)
+            elif current_section is not None:
+                current_section.lines.append(line)
+        if current_section is not None:
+            self.sections.append(current_section)
 
 
 class EmbeddingStore:
@@ -27,24 +81,25 @@ class EmbeddingStore:
             .embedding
         )
 
-    def store(self, key: str, content: str):
-        if content == "":
-            return
-        embedding = self.embedding_of(content)
-        output_file_path = self._key_to_store_path(key)
+    def store(self, chunk: MarkdownChunk):
+        embedding = EmbeddedChunk(chunk=chunk, vector=self.embedding_of(chunk.content))
+        output_file_path = self._key_to_store_path(chunk.key)
         with open(output_file_path, "w") as out:
-            out.write("\n".join([str(f) for f in embedding]))
+            out.write(embedding.model_dump_json())
 
-    def get_closest_n(self, target: str, n: int) -> list[tuple[str, float]]:
+    def get_closest_n(self, target: str, n: int) -> list[tuple[EmbeddedChunk, float]]:
         target_embedding = np.array(self.embedding_of(target))
         all_files = [file for file in self.store_directory.rglob("*") if file.is_file]
-        embeddings = [(file, self._load_embedding(file)) for file in all_files]
+        embeddings = [self._load_embedding(file) for file in all_files]
         scored = [
-            (file, self._cosign_similarity(target_embedding, embedding))
-            for file, embedding in embeddings
+            (
+                embedding,
+                self._cosign_similarity(target_embedding, np.array(embedding.vector)),
+            )
+            for embedding in embeddings
         ]
         scored.sort(reverse=True, key=lambda tup: tup[1])
-        return [(self._store_path_to_key(file), score) for file, score in scored[0:n]]
+        return scored[0:n]
 
     def _key_to_store_path(self, key: str) -> Path:
         output_file_name = base64.urlsafe_b64encode(key.encode()).decode()
@@ -56,8 +111,7 @@ class EmbeddingStore:
 
     def _load_embedding(self, file: Path):
         with open(file, "r") as f:
-            lines = f.readlines()
-        return np.array([float(line) for line in lines if line.strip() != ""])
+            return EmbeddedChunk.model_validate_json(f.read())
 
     def _cosign_similarity(self, v1: np.ndarray, v2: np.ndarray) -> float:
         if len(v1) != len(v2):
@@ -98,21 +152,25 @@ class Chat:
     def _make_assistant_message(self, content: str) -> ChatCompletionMessageParam:
         return ChatCompletionAssistantMessageParam(role="assistant", content=content)
 
-    def _load_as_rag_source(self, file: Path) -> ChatCompletionMessageParam:
-        with open(file, "r") as f:
-            content = f.read()
-        message = f"In answering questions, the following content from a file may be useful:\n {content}"
+    def _as_rag_source(self, chunk: MarkdownChunk) -> ChatCompletionMessageParam:
+        message = f"In answering questions, the following content from a file may be useful:\n {chunk.content}"
         return self._make_user_message(message)
 
     def add_message(self, message: str) -> str:
         if message.endswith("?") and self._db is not None:
-            useful_files = [
-                Path(name)
-                for name, similarity in self._db.get_closest_n(message, 3)
-                if similarity >= 0.5
+            useful_chunks = get_n_closest_notes(self._db, message, 4, 0.6)
+            rag_messages = [
+                self._as_rag_source(chunk) for chunk, _score in useful_chunks
             ]
-            rag_messages = [self._load_as_rag_source(file) for file in useful_files]
-            print(f"Adding context: {[file.name for file in useful_files]}")
+            print("Adding context:")
+            print(
+                "\n".join(
+                    [
+                        f"{score}: {chunk.original_file_path}"
+                        for chunk, score in useful_chunks
+                    ]
+                )
+            )
             for rag_message in rag_messages:
                 self.conversation.append(rag_message)
 
@@ -131,40 +189,82 @@ class Chat:
 
 
 def find_files(root: Path, pattern="*.md") -> list[str]:
+    ignore_pattern = {"node_modules", "site-packages", "gems", "Pods"}
     return [
         str(file_path.resolve())
         for file_path in root.rglob(pattern)
-        if file_path.is_file()
+        if file_path.is_file() and (set(file_path.parts).isdisjoint(ignore_pattern))
     ]
 
 
 def store_notes(store: EmbeddingStore, note_directory: Path):
     files = find_files(note_directory)
     for file in files:
-        with open(file, "r") as f:
-            content = f.read()
-        store.store(str(file), content)
+        print("Processing: ", file)
+        chunks = chunk_markdown_file(Path(file))
+        for chunk in chunks:
+            store.store(chunk)
 
 
 def get_n_closest_notes(
     store: EmbeddingStore, target: str, n: int, threshold: float = 0.5
-) -> list[Path]:
-    matches = store.get_closest_n(target, n)
-    return [Path(file) for file, distance in matches if distance >= threshold]
+) -> list[tuple[MarkdownChunk, float]]:
+    return [
+        (stored.chunk, score)
+        for stored, score in store.get_closest_n(target, n)
+        if score >= threshold
+    ]
 
 
-def initiate_chat(chat: Chat):
+def initiate_chat(chat: Chat, initial_message: Optional[str] = None):
     def input_generator():
         """A generator that yields user input lines until 'stop' is entered."""
+        if initial_message is not None:
+            yield initial_message
         while True:
             user_input = input("You say: ")
-            if user_input.lower() == "stop":
+            if user_input.lower() in {
+                "stop",
+                "thanks",
+                "that's all",
+                "dismissed",
+                "exit",
+            }:
                 break
             yield user_input
 
     for user_input in input_generator():
         reply = chat.add_message(user_input)
         print(f"Reply: {reply}")
+
+
+def chunk_markdown_file(path: Path) -> list[MarkdownChunk]:
+    md = MarkdownFile(path)
+    local_file_name = path.name.split(".")[0]
+    hashed_path = base64.urlsafe_b64encode(
+        hashlib.md5(str(path).encode()).digest()
+    ).decode()
+    chunks = [
+        MarkdownChunk(
+            original_file_path=str(path),
+            key=f"{hashed_path}##{section.header}",
+            content="\n".join([local_file_name, section.header, *section.lines]),
+        )
+        for section in md.sections
+        if len([line for line in section.lines if line != ""]) > 0
+    ]
+    if md.pre_section is not None and len(
+        [line for line in md.pre_section if line != ""]
+    ):
+        chunks.append(
+            MarkdownChunk(
+                original_file_path=str(path),
+                key=f"{hashed_path}-pre",
+                content=" ".join(md.pre_section),
+            )
+        )
+
+    return chunks
 
 
 def main():
@@ -175,17 +275,20 @@ def main():
         case ["store-all", dir]:
             store_notes(db, Path(dir))
         case ["find", n, text]:
-            paths = [str(path) for path in get_n_closest_notes(db, text, int(n))]
-            for path in paths:
-                print(path)
-        case ["chat"]:
+            chunks = get_n_closest_notes(db, text, int(n))
+            for chunk, score in chunks:
+                print(chunk)
+                print()
+        case ["chat", *rest]:
+            initial_message = " ".join(rest) if len(rest) > 0 else None
             initiate_chat(
                 Chat(
                     client,
-                    "llama-3.2-3b-instruct",
-                    "You are a helpful professional who treats content from files as a useful reference when answering questions. When replying try not to include too much extraneous content",
+                    "Hermes-3-Llama-3.1-8B-GGUF",
+                    f"You are a helpful professional (named Baldric) who treats content from files as a useful reference when answering questions. When replying try not to include too much extraneous content. Today's date is {datetime.now().strftime('%B %d, %Y')}",
                     db,
-                )
+                ),
+                initial_message,
             )
         case _:
             print("unrecognised command")
