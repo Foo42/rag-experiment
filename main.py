@@ -7,9 +7,44 @@ from openai.types.chat import (
     ChatCompletionUserMessageParam,
 )
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Protocol
 from datetime import datetime
+
+from pydantic_ai.messages import ModelMessage
 from embeddings import EmbeddingStore, MarkdownChunk
+
+from pydantic_ai import Agent, RunContext
+from pydantic_ai.models.openai import OpenAIModel
+from pydantic_ai.providers.openai import OpenAIProvider
+
+
+class ChatLike(Protocol):
+    def add_message(self, message: str) -> str: ...
+
+
+class PydanticChat:
+    main_agent: Agent
+    all_messages: list[ModelMessage]
+
+    def __init__(
+        self,
+        model_name: str,
+        system_prompt: str = "",
+    ):
+        self.all_messages = []
+        ollama_model = OpenAIModel(
+            model_name=model_name,
+            provider=OpenAIProvider(base_url="http://localhost:1234/v1"),
+        )
+        self.main_agent = Agent(
+            ollama_model,
+            system_prompt=system_prompt,
+        )
+
+    def add_message(self, message: str) -> str:
+        result = self.main_agent.run_sync(message, message_history=self.all_messages)
+        self.all_messages = result.all_messages()
+        return str(result.data)
 
 
 class Chat:
@@ -97,7 +132,7 @@ def get_n_closest_notes(
     ]
 
 
-def initiate_chat(chat: Chat, initial_message: Optional[str] = None):
+def initiate_chat(chat: ChatLike, initial_message: Optional[str] = None):
     def input_generator():
         """A generator that yields user input lines until 'stop' is entered."""
         if initial_message is not None:
@@ -134,11 +169,9 @@ def main():
         case ["chat", *rest]:
             initial_message = " ".join(rest) if len(rest) > 0 else None
             initiate_chat(
-                Chat(
-                    client,
-                    "Hermes-3-Llama-3.1-8B-GGUF",
-                    f"You are a helpful professional (named Baldric) who treats content from files as a useful reference when answering questions. When replying try not to include too much extraneous content. Today's date is {datetime.now().strftime('%B %d, %Y')}",
-                    db,
+                PydanticChat(
+                    model_name="Hermes-3-Llama-3.1-8B-GGUF",
+                    system_prompt=f"You are a helpful professional (named Baldric) who treats content from files as a useful reference when answering questions. When replying try not to include too much extraneous content. Today's date is {datetime.now().strftime('%B %d, %Y')}",
                 ),
                 initial_message,
             )
